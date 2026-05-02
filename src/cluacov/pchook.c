@@ -246,7 +246,29 @@ static void pc_hook(lua_State *L, lua_Debug *ar) {
     lua_pop(L, 1);
 
     ci = (CallInfo *)ar->i_ci;
-    pc = (int)(ci->u.l.savedpc - proto->code);
+
+    /*
+     * IMPORTANT: account for the "savedpc points to NEXT instruction" convention.
+     *
+     * Lua's interpreter (luaG_traceexec in ldebug.c) does `pc++; ci->u.l.savedpc = pc;`
+     * BEFORE invoking any hook. So when our count hook runs, `savedpc` already
+     * points to the instruction that will execute NEXT, not the one that just ran.
+     *
+     * Without compensating for this, every hit would be attributed to the wrong PC,
+     * causing two visible defects:
+     *   1) The very FIRST instruction of every Lua function shows hits = 0
+     *      (e.g. `local t = obj.field` at the top of a function body),
+     *   2) The next line gets double-counted (its own hits + the previous instruction's).
+     *
+     * The fix is `pc - 1`. The single edge case is when savedpc still points to
+     * the very first instruction of the function (CIST_FRESH frame, hook fired
+     * before any instruction has actually executed in this frame). In that case
+     * pc would be 0 and pc - 1 would be -1, which is meaningless. We skip those.
+     */
+    pc = (int)(ci->u.l.savedpc - proto->code) - 1;
+    if (pc < 0) {
+        return;
+    }
 
     if (push_hits_for_proto(L, proto) != 0) {
         return;

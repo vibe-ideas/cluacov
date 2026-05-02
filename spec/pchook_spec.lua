@@ -173,6 +173,102 @@ describe("pchook", function()
          end)
       end)
 
+      describe("regression: savedpc-points-to-next-instruction (issue: first-line-of-body shows hit=0)", function()
+         -- See docs/bugs/2026-05-02-savedpc-off-by-one.md.
+         --
+         -- Lua's interpreter calls hooks AFTER advancing savedpc to the next
+         -- instruction (see luaG_traceexec in ldebug.c). Before this fix
+         -- pchook used `pc = savedpc - code` directly, which attributed each
+         -- count to the *next* instruction. Visible symptoms:
+         --   * the first line of every function body reported hits = 0
+         --   * the next line reported inflated hits (its own + the previous)
+
+         it("attributes hits to the actually-executed PC, not the next one", function()
+            -- Per-PC view: every PC that runs at least once must have hits >= 1.
+            -- Before the fix, the first PC (always the function body's first
+            -- bytecode) had hits = 0.
+            local func = load_function([[
+               return function(cobj)
+                  local t = cobj._type
+                  if t ~= "struct" and t ~= "list" and t ~= "map" then
+                     error("invalid")
+                  end
+                  return "ok"
+               end
+            ]])
+
+            pchook.start()
+            for _ = 1, 3 do func({_type = "struct"}) end
+            pchook.stop()
+
+            local result = pchook.get_hits(func)
+            local first_pc_hits = result[1].hits[0] or 0
+            assert.is_true(first_pc_hits >= 1,
+               "first instruction (PC=0) of an executed function must have hits >= 1, got " .. first_pc_hits)
+         end)
+
+         it("function body first line shows correct hit count (line view)", function()
+            -- Line-mapped view of the same regression. The first executable
+            -- line inside the function body must be HIT, with the same count
+            -- as the if/return that follow it on the same code path.
+            local func = load_function([[
+               return function(cobj)
+                  local t = cobj._type      -- expected: 3 hits
+                  if t == "struct" then     -- expected: 3 hits
+                     return "ok"            -- expected: 3 hits
+                  end
+                  return "no"
+               end
+            ]])
+
+            pchook.start()
+            for _ = 1, 3 do func({_type = "struct"}) end
+            pchook.stop()
+
+            local lines = pchook.get_line_hits(func)
+
+            -- Find the first line that has a hit count assigned (i.e. is
+            -- "active"); it corresponds to `local t = cobj._type`.
+            local first_active_line, first_hits
+            for line_nr = 1, lines.max do
+               if lines[line_nr] then
+                  first_active_line = line_nr
+                  first_hits = lines[line_nr]
+                  break
+               end
+            end
+
+            assert.is_number(first_active_line)
+            assert.is_true(first_hits >= 1,
+               "first active line of function body must have hits >= 1, got " ..
+               tostring(first_hits) .. " (at line " .. tostring(first_active_line) .. ")")
+         end)
+      end)
+
+      describe("regression: stable across many start/stop cycles (issue: random crash on simple use)", function()
+         -- See docs/bugs/2026-05-02-pchook-startstop-crash.md.
+         --
+         -- A misbuilt pchook.so against the wrong Lua headers used to
+         -- segfault inside the very first lua_rawsetp call in l_start when
+         -- loaded by a Lua VM with a different ABI. This regression test
+         -- exercises the start/stop path in tight loops; if pchook.so was
+         -- built against the wrong headers, this test will reliably crash
+         -- the VM long before it finishes.
+
+         it("survives 200 start/run/stop/reset cycles", function()
+            local func = load_function([[
+               return function(x) return x + 1 end
+            ]])
+            for _ = 1, 200 do
+               pchook.start()
+               func(1)
+               pchook.stop()
+               pchook.reset()
+            end
+            assert.is_true(true)  -- if we got here, no segfault
+         end)
+      end)
+
       describe("get_line_hits", function()
          it("throws error for non-function argument", function()
             assert.error(function() pchook.get_line_hits(5) end)
